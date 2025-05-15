@@ -109,7 +109,7 @@ bool TFLiteModel::Inference(uint8_t * input_data, int input_size, float * output
     }
 
     // Copy input_data into the tensor
-    memcpy(input_tensor->data.uint8, input_data, input_size * sizeof(uint8_t));
+    // memcpy(input_tensor->data.uint8, input_data, input_size * sizeof(uint8_t));
     
     // Run inference
     if (interpreter->Invoke() != kTfLiteOk) 
@@ -135,4 +135,12 @@ bool TFLiteModel::Inference(uint8_t * input_data, int input_size, float * output
     inference_count++;
 
     return true;
+}
+
+/*
+ * Get the input tensor pointer
+ */
+uint8_t * TFLiteModel::GetInputTensor()
+{
+    return input_tensor->data.uint8;
 }

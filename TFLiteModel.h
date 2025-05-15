@@ -17,6 +17,8 @@ class TFLiteModel
         void Init();
         bool Inference(uint8_t * input_data, int input_size, float * output_data, int output_size);
 
+        uint8_t * GetInputTensor();
+
     private:
         void TFLiteModel_Init();
         void Interpreter_Init();

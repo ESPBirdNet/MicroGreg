@@ -19,9 +19,6 @@ static SSD1306Wire  display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, R
 
 TFLiteModel tfliteModel;
 
-// Variable types
-#define uint8 uint8_t
-
 //============================== Pinout ==============================
 #define MIC_SD   7    // data out from INMP441
 #define MIC_WS   5    // word select (LRCLK)
@@ -33,12 +30,12 @@ TFLiteModel tfliteModel;
 #define SAMPLE_RATE_HZ              32000
 
 // DMA buffer count & length (1024 samples each)
-#define DMA_BUF_LEN                 512                     // 16ms of audio
-#define DMA_BUF_COUNT               64 + 32                 // 1s of stored audio + next quarter of second + residual
+#define DMA_BUF_LEN                 1024                    // 16ms of audio
+#define DMA_BUF_COUNT               32 + 16                 // 1s of stored audio + next quarter of second + residual
 
 // FFT / spectrogram parameters
-#define WIN_BUFFERS            64                           // around 1 second of audio
-#define HOP_BUFFERS            32                           // After collecting how many new buffers should a new spectrogram be computed? Once every 1/HOP_BUFFERS seconds!
+#define WIN_BUFFERS            32                           // around 1 second of audio
+#define HOP_BUFFERS            16                           // After collecting how many new buffers should a new spectrogram be computed? Once every 1/HOP_BUFFERS seconds!
 #define FFT_SIZE               1024                         // 2 * DMA_BUF_LEN for simple hop in FFT computation and good enough frequency resolution
 #define NUM_BANDS              128
 
@@ -61,9 +58,6 @@ static QueueHandle_t i2s_evt_queue  = nullptr;
 // Count buffers to trigger spectrogram
 static volatile int bufferCount = 0;
 
-// overlap storage for FFT windowing
-static int16_t overlapBuff[FFT_SIZE / 2];
-
 // Hann window & FFT arrays
 static float * hann_window;
 static float * fft_buffer;
@@ -71,12 +65,13 @@ static float * power_spectrum;
 static float   band_energy;
 // static float   band_energies[NUM_BANDS];
 
-static uint8   spectrogram_data[NUM_BANDS * SPECTROGRAM_WIDTH];
+static uint8_t * spectrogram_data = nullptr;
 
-// Spectrogram task handle
-static TaskHandle_t spectroTaskHandle = nullptr;
+// Task handles
+static TaskHandle_t SpectrogramTaskHandle = nullptr;
+static TaskHandle_t InferenceTaskHandle = nullptr;
 
-String species_list[6] = { "Larus michahellis", "Columba livia", "Myiopsitta monachus", "Psittacula krameri", "Corvus cornix" };
+String species_list[5] = { "Larus michahellis", "Columba livia", "Myiopsitta monachus", "Psittacula krameri", "Corvus cornix" };
 
 //============================== I2S pin config ==============================
 static const i2s_pin_config_t pin_config =
@@ -126,9 +121,9 @@ static void i2s_event_task(void* arg)
                 i2s_read( I2S_NUM, audioBufs[bufIndex], DMA_BUF_LEN * sizeof(int16_t), &bytesRead, 0 );
 
                 // trigger spectrogram every HOP_BUFFERS
-                if (spectroTaskHandle && ++bufferCount >= HOP_BUFFERS) 
+                if (SpectrogramTaskHandle && ++bufferCount >= HOP_BUFFERS) 
                 {
-                    xTaskNotifyGive(spectroTaskHandle);
+                    xTaskNotifyGive(SpectrogramTaskHandle);
                     bufferCount = 0;
                 }
 
@@ -147,7 +142,8 @@ static void i2s_event_task(void* arg)
  * Use a 50% hop between frames
  * Output the spectrogram in a global var in decibels
  */
-static void SpectrogramTask(void* arg) {
+static void SpectrogramTask(void* arg) 
+{
     // Initialize DSP components
     hann_window = (float*)heap_caps_malloc(FFT_SIZE * sizeof(float), MALLOC_CAP_32BIT | MALLOC_CAP_8BIT);
     fft_buffer = (float*)heap_caps_malloc(FFT_SIZE * 2 * sizeof(float), MALLOC_CAP_32BIT | MALLOC_CAP_8BIT);
@@ -172,11 +168,13 @@ static void SpectrogramTask(void* arg) {
     // Flag used for skipping first second of sampling
     bool bFirstCall = true;
 
-    while (true) {
+    while (true) 
+    {
         // wait for notification
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        // Serial.printf("Spectrogram stack headroom: %u bytes\n", uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)); // Print minimum ever free available task space
+        // Print minimum ever free available task space
+        // Serial.printf("Spectrogram stack headroom: %u bytes\n", uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
 
         // Skip if not enough data has been collected yet
         if (bFirstCall && bufIndex < WIN_BUFFERS) 
@@ -194,16 +192,12 @@ static void SpectrogramTask(void* arg) {
         for (int frame_index = 0; frame_index < SPECTROGRAM_WIDTH; frame_index++) 
         {
             // Compute the buffer index for this frame
-            int idx1 = (bufIndex_copy + DMA_BUF_COUNT - WIN_BUFFERS + frame_index * 2) % DMA_BUF_COUNT; // No hop
-            // int idx1 = (bufIndex_copy + DMA_BUF_COUNT - WIN_BUFFERS + frame_index) % DMA_BUF_COUNT;
-            int idx2 = (idx1 + 1) % DMA_BUF_COUNT;
+            int idx = (bufIndex_copy - WIN_BUFFERS + frame_index) % DMA_BUF_COUNT;
 
             for (int i = 0; i < DMA_BUF_LEN; i++) 
             {
-                fft_buffer[2 * i] = audioBufs[idx1][i] * hann_window[i];
+                fft_buffer[2 * i + 0] = audioBufs[idx][i] * hann_window[i];
                 fft_buffer[2 * i + 1] = 0.0f;
-                fft_buffer[2 * (DMA_BUF_LEN + i)] = audioBufs[idx2][i] * hann_window[DMA_BUF_LEN + i];
-                fft_buffer[2 * (DMA_BUF_LEN + i) + 1] = 0.0f;
             }
 
             // Perform FFT
@@ -230,32 +224,23 @@ static void SpectrogramTask(void* arg) {
                     sum += power_spectrum[k];
                 }
 
+                // Clip and scale to cover all 0 to 255 uint8 values
                 band_energy = 10.0f * log10f(sum + 1e-12f);
                 band_energy = constrain(band_energy, SPECTRUM_FLOOR, SPECTRUM_CEIL);
                 band_energy = (band_energy - SPECTRUM_FLOOR) * SPECTRUM_SCALE;
                 band_energy = constrain(band_energy, 0.f, 255.f);
-                spectrogram_data[b + frame_index * NUM_BANDS] = (uint8)band_energy;
-
-                // band_energies[b] = 10.0f * log10f(sum + 1e-12f);
-                // band_energies[b] = constrain(band_energies[b], SPECTRUM_FLOOR, SPECTRUM_CEIL); // Convert to decibels with 10.f for better classification stabilty
-                // // spectrogram_data[b + frame_index * NUM_BANDS] = band_energies[b]; // Store the band energies
-                // spectrogram_data[b + frame_index * NUM_BANDS] = (uint8)round( (band_energies[b] - SPECTRUM_FLOOR) * SPECTRUM_SCALE);
+                spectrogram_data[b + frame_index * NUM_BANDS] = (uint8_t)band_energy;
             }
         }
         /*** END OF SPECTROGRAM COMPUTATION ***/
 
-        Serial.println("Performance partial ms:" + String((micros() - time) / 1000.f));
-        
+        Serial.println("[Spectrogram] Performance ms:" + String((micros() - time) / 1000.f));
+
         // DisplaySpectrogram_Serial();
         // DisplaySpectrogram_OLED(); 
         
-        float scores[5];
-        if (tfliteModel.Inference(spectrogram_data, NUM_BANDS * SPECTROGRAM_WIDTH, scores, 5)) 
-        {   
-            Serial.println("Performance total ms:" + String((micros() - time) / 1000.f));
-            DisplayScores_OLED(scores, 5, (micros() - time) / 1000.f);
-            //DisplayScores_Serial(scores, 5);
-        }
+        xTaskNotifyGive(InferenceTaskHandle);
+
     } // End of while loop
 
     // Cleanup - This code is reached only if the task is explicitly deleted.
@@ -266,6 +251,35 @@ static void SpectrogramTask(void* arg) {
     vTaskDelete(NULL); // Delete the task itself.
 }
 
+/* 
+ * Inference task
+ *
+ * Do a prediction and display it
+ */
+static void InferenceTask(void* arg) 
+{
+    float scores[5];
+    while (true) 
+    {
+        // wait for notification
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // Print minimum ever free available task space
+        //Serial.printf("Inference stack headroom: %u bytes\n", uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)); 
+        
+        // Save time for evaluation
+        unsigned long time = micros();
+
+        // Do a prediction
+        if (tfliteModel.Inference(spectrogram_data, NUM_BANDS * SPECTROGRAM_WIDTH, scores, 5)) 
+        {   
+            // Display the results
+            Serial.println("[Inference] Performance ms:" + String((micros() - time) / 1000.f));
+            DisplayScores_OLED(scores, 5, (micros() - time) / 1000.f);
+            //DisplayScores_Serial(scores, 5);
+        }
+    }
+}
 
 /*
  * Monitor Task
@@ -322,17 +336,25 @@ void setup()
 
     // Init the TFLite model - allocate tensor arena, model. etc.
     tfliteModel.Init();
+    spectrogram_data = tfliteModel.GetInputTensor();
+    if(spectrogram_data == nullptr)
+    {
+        spectrogram_data = (uint8_t*)malloc(NUM_BANDS * SPECTROGRAM_WIDTH * sizeof(uint8_t));
+    }
 
     // start monitoring task
-    xTaskCreate( monitorTask, "TaskMonitor", 2048, nullptr, tskIDLE_PRIORITY+1, nullptr );
+    xTaskCreate( monitorTask, "TaskMonitor", 2048, nullptr, tskIDLE_PRIORITY + 1, nullptr );
 
     // install I2S driver with event queue
     ESP_ERROR_CHECK( i2s_driver_install( I2S_NUM, &i2s_cfg, DMA_BUF_COUNT, &i2s_evt_queue) );
     ESP_ERROR_CHECK( i2s_set_pin(I2S_NUM, &pin_config) );
     ESP_ERROR_CHECK( i2s_zero_dma_buffer(I2S_NUM) );
   
+    // start inference task
+    xTaskCreatePinnedToCore( InferenceTask, "Inference", 1024 * 3, nullptr, configMAX_PRIORITIES, &InferenceTaskHandle, 0 );                // stack - 2700 bytes used
+
     // start spectrogram task
-    xTaskCreatePinnedToCore( SpectrogramTask, "Spectrogram", 2048 * 4, nullptr, configMAX_PRIORITIES - 1, &spectroTaskHandle, 0 );
+    xTaskCreatePinnedToCore( SpectrogramTask, "Spectrogram", 1024 * 3, nullptr, configMAX_PRIORITIES - 1, &SpectrogramTaskHandle, 0 );      // stack - 1400 bytes used
 
     // start I2S event task
     xTaskCreatePinnedToCore( i2s_event_task, "I2S_Event", 2048, nullptr, configMAX_PRIORITIES - 1, nullptr, 1 );
