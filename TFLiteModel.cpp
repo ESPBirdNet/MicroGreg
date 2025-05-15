@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include "model.h"
+#include "model_QAT.h"
 #include "TFLiteModel.h"
 
 // Globals, used for compatibility with Arduino-style sketches.
@@ -11,7 +11,7 @@ namespace
   TfLiteTensor * output_tensor = nullptr;
   int inference_count = 0;
 
-  constexpr int kTensorArenaSize = 128 * 1024;
+  constexpr int kTensorArenaSize = 58 * 1024;
   static uint8_t tensor_arena[kTensorArenaSize];
 }  // namespace
 
@@ -74,7 +74,7 @@ void TFLiteModel::TFLiteModel_Init()
     }
 
     Interpreter_Init();
-   
+
     // Allocate memory from the tensor_arena for the model's tensors.
     TfLiteStatus allocate_status = interpreter->AllocateTensors();
     if (allocate_status != kTfLiteOk) 
@@ -96,49 +96,7 @@ void TFLiteModel::TFLiteModel_Init()
  * To use with full float32 models
  * Inference will be slower, memory usage higher
  */
-bool TFLiteModel::Inference(float * input_data, int input_size, float * output_data, int output_size)
-{
-    // Sanity check: does the input tensor have enough space?
-    if (input_size != input_tensor->bytes / sizeof(float)) 
-    {
-        Serial.print("Expected ");
-        Serial.print(input_tensor->bytes);
-        Serial.print(" floats, got ");
-        Serial.println(input_size);
-        return false;
-    }
-
-    for (int i = 0; i < input_size; i++) 
-    {
-        input_tensor->data.f[i] = input_data[i];
-    }
-
-    // Copy input_data into the tensor
-    // memcpy(input_tensor->data.f, input_data, input_size * sizeof(float));
-
-    // Run inference
-    if (interpreter->Invoke() != kTfLiteOk) 
-    {
-        Serial.println("Inference failed");
-        return false;
-    }
-
-    for (int i = 0; i < output_size; i++) 
-    {
-        output_data[i] = output_tensor->data.f[i];
-    }
-
-    inference_count++;
-
-    return true;
-}
-
-/*
- * Do a prediction
- * Quantize the input array
- * Ensure that the model quantization parameters are well calibrated 
- */
-bool TFLiteModel::Inference_Quantize(float * input_data, int input_size, float * output_data, int output_size)
+bool TFLiteModel::Inference(uint8_t * input_data, int input_size, float * output_data, int output_size)
 {
     // Sanity check: does the input tensor have enough space?
     if (input_size != input_tensor->bytes) 
@@ -150,29 +108,9 @@ bool TFLiteModel::Inference_Quantize(float * input_data, int input_size, float *
         return false;
     }
 
-    // Quantize input
-    const float   scale      = input_tensor->params.scale;
-    const int32_t zero_point = input_tensor->params.zero_point;
-    for (int i = 0; i < input_size; i++) 
-    {
-        // 1) scale and shift
-        int32_t q = lrintf(input_data[i] / scale) + zero_point;
-        // 2) clip to tensor’s valid range
-        if (input_tensor->type == kTfLiteUInt8) 
-        {
-            q = q < 0   ? 0   : (q > 255 ? 255 : q);
-            input_tensor->data.uint8[i] = static_cast<uint8_t>(q);
-        } 
-        else 
-        {  // kTfLiteInt8
-            q = q < -128 ? -128 : (q > 127 ? 127 : q);
-            input_tensor->data.int8[i] = static_cast<int8_t>(q);
-        }
-    }
-
     // Copy input_data into the tensor
-    // memcpy(input_tensor->data.f, input_data, input_size * sizeof(float));
-
+    memcpy(input_tensor->data.uint8, input_data, input_size * sizeof(uint8_t));
+    
     // Run inference
     if (interpreter->Invoke() != kTfLiteOk) 
     {
@@ -193,14 +131,6 @@ bool TFLiteModel::Inference_Quantize(float * input_data, int input_size, float *
             output_data[i] = (src[i] - out_zero_point) * out_scale;
         }
     } 
-    else 
-    {  // kTfLiteInt8
-        int8_t *src = output_tensor->data.int8;
-        for (int i = 0; i < to_copy; i++) 
-        {
-            output_data[i] = (src[i] - out_zero_point) * out_scale;
-        }
-    }
 
     inference_count++;
 

@@ -19,6 +19,9 @@ static SSD1306Wire  display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, R
 
 TFLiteModel tfliteModel;
 
+// Variable types
+#define uint8 uint8_t
+
 //============================== Pinout ==============================
 #define MIC_SD   7    // data out from INMP441
 #define MIC_WS   5    // word select (LRCLK)
@@ -27,21 +30,29 @@ TFLiteModel tfliteModel;
 //============================== Configuration ==============================
 #define I2S_NUM                     I2S_NUM_0
 #define SAMPLE_BITS                 I2S_BITS_PER_SAMPLE_16BIT
-#define SAMPLE_RATE_HZ              16000
+#define SAMPLE_RATE_HZ              32000
 
 // DMA buffer count & length (1024 samples each)
-#define DMA_BUF_COUNT               32
-#define DMA_BUF_LEN                 1024
+#define DMA_BUF_LEN                 512                     // 16ms of audio
+#define DMA_BUF_COUNT               64 + 32                 // 1s of stored audio + next quarter of second + residual
 
 // FFT / spectrogram parameters
-#define WIN_BUFFERS            16                           // around 1 second of audio
-#define HOP_BUFFERS            4                            // After collecting how many new buffers should a new spectrogram be computed? Once every 1/HOP_BUFFERS seconds!
-#define FFT_SIZE               2048                         // 2 * DMA_BUF_LEN for simple hop in FFT computation and good enough frequency resolution
-#define NUM_BANDS              64
+#define WIN_BUFFERS            64                           // around 1 second of audio
+#define HOP_BUFFERS            32                           // After collecting how many new buffers should a new spectrogram be computed? Once every 1/HOP_BUFFERS seconds!
+#define FFT_SIZE               1024                         // 2 * DMA_BUF_LEN for simple hop in FFT computation and good enough frequency resolution
+#define NUM_BANDS              128
+
+#define SPECTROGRAM_WIDTH      (DMA_BUF_LEN * WIN_BUFFERS) / FFT_SIZE                          // 32 and no hop
+// #define SPECTROGRAM_WIDTH      (DMA_BUF_LEN * WIN_BUFFERS - FFT_SIZE) / DMA_BUF_LEN - 1     // 61 (not 63!) - 50% Hop
+
+//============================== Globals ==============================
+#define SPECTRUM_FLOOR          30
+#define SPECTRUM_CEIL           158
+#define SPECTRUM_SCALE          (256 / (SPECTRUM_CEIL - SPECTRUM_FLOOR))
 
 //============================== Globals ==============================
 // DMA buffers
-static int16_t*  audioBufs[DMA_BUF_COUNT];
+static int16_t * audioBufs[DMA_BUF_COUNT];
 static volatile size_t bufIndex = 0;
 
 // I2S event queue
@@ -57,14 +68,15 @@ static int16_t overlapBuff[FFT_SIZE / 2];
 static float * hann_window;
 static float * fft_buffer;
 static float * power_spectrum;
-static float   band_energies[NUM_BANDS];
+static float   band_energy;
+// static float   band_energies[NUM_BANDS];
 
-static float   spectrogram_data[NUM_BANDS * (WIN_BUFFERS - 1) * 2];
+static uint8   spectrogram_data[NUM_BANDS * SPECTROGRAM_WIDTH];
 
 // Spectrogram task handle
 static TaskHandle_t spectroTaskHandle = nullptr;
 
-String species_list[6] = { "Larus michahellis", "Columba livia", "Myiopsitta monachus", "Psittacula krameri", "Corvus cornix", "unknown" };
+String species_list[6] = { "Larus michahellis", "Columba livia", "Myiopsitta monachus", "Psittacula krameri", "Corvus cornix" };
 
 //============================== I2S pin config ==============================
 static const i2s_pin_config_t pin_config =
@@ -179,10 +191,11 @@ static void SpectrogramTask(void* arg) {
         size_t bufIndex_copy = bufIndex;
 
         /*** START OF SPECTROGRAM COMPUTATION ***/
-        for (int frame_index = 0; frame_index < (WIN_BUFFERS - 1) * 2; frame_index++) 
+        for (int frame_index = 0; frame_index < SPECTROGRAM_WIDTH; frame_index++) 
         {
             // Compute the buffer index for this frame
-            int idx1 = (bufIndex_copy + DMA_BUF_COUNT - WIN_BUFFERS + frame_index) % DMA_BUF_COUNT;
+            int idx1 = (bufIndex_copy + DMA_BUF_COUNT - WIN_BUFFERS + frame_index * 2) % DMA_BUF_COUNT; // No hop
+            // int idx1 = (bufIndex_copy + DMA_BUF_COUNT - WIN_BUFFERS + frame_index) % DMA_BUF_COUNT;
             int idx2 = (idx1 + 1) % DMA_BUF_COUNT;
 
             for (int i = 0; i < DMA_BUF_LEN; i++) 
@@ -216,8 +229,17 @@ static void SpectrogramTask(void* arg) {
                 {
                     sum += power_spectrum[k];
                 }
-                band_energies[b] = 10.0f * log10f(sum + 1e-12f); // Convert to decibels with 10.f for better classification stabilty
-                spectrogram_data[b + frame_index * NUM_BANDS] = band_energies[b]; // Store the band energies
+
+                band_energy = 10.0f * log10f(sum + 1e-12f);
+                band_energy = constrain(band_energy, SPECTRUM_FLOOR, SPECTRUM_CEIL);
+                band_energy = (band_energy - SPECTRUM_FLOOR) * SPECTRUM_SCALE;
+                band_energy = constrain(band_energy, 0.f, 255.f);
+                spectrogram_data[b + frame_index * NUM_BANDS] = (uint8)band_energy;
+
+                // band_energies[b] = 10.0f * log10f(sum + 1e-12f);
+                // band_energies[b] = constrain(band_energies[b], SPECTRUM_FLOOR, SPECTRUM_CEIL); // Convert to decibels with 10.f for better classification stabilty
+                // // spectrogram_data[b + frame_index * NUM_BANDS] = band_energies[b]; // Store the band energies
+                // spectrogram_data[b + frame_index * NUM_BANDS] = (uint8)round( (band_energies[b] - SPECTRUM_FLOOR) * SPECTRUM_SCALE);
             }
         }
         /*** END OF SPECTROGRAM COMPUTATION ***/
@@ -227,8 +249,8 @@ static void SpectrogramTask(void* arg) {
         // DisplaySpectrogram_Serial();
         // DisplaySpectrogram_OLED(); 
         
-        float scores[6];
-        if (tfliteModel.Inference(spectrogram_data, NUM_BANDS * (WIN_BUFFERS - 1) * 2, scores, 6)) 
+        float scores[5];
+        if (tfliteModel.Inference(spectrogram_data, NUM_BANDS * SPECTROGRAM_WIDTH, scores, 5)) 
         {   
             Serial.println("Performance total ms:" + String((micros() - time) / 1000.f));
             DisplayScores_OLED(scores, 5, (micros() - time) / 1000.f);
@@ -302,7 +324,7 @@ void setup()
     tfliteModel.Init();
 
     // start monitoring task
-    // xTaskCreate( monitorTask, "TaskMonitor", 2048, nullptr, tskIDLE_PRIORITY+1, nullptr );
+    xTaskCreate( monitorTask, "TaskMonitor", 2048, nullptr, tskIDLE_PRIORITY+1, nullptr );
 
     // install I2S driver with event queue
     ESP_ERROR_CHECK( i2s_driver_install( I2S_NUM, &i2s_cfg, DMA_BUF_COUNT, &i2s_evt_queue) );
@@ -328,11 +350,12 @@ void DisplaySpectrogram_Serial()
 {
     // Output spectrogram data after processing all 16 buffers
     // after spectrogram_data[...] is filled
-    Serial.println("Spectrogram (64 bands):");
-    for (int i = 0; i < (WIN_BUFFERS-1)*2; i++) {
-        for (int j = 0; j < 64; j++) {
-            Serial.print(spectrogram_data[j + i * 64], 2);
-            if (j+1 < 64) Serial.print(',');
+    Serial.println("Spectrogram (128 bands):");
+    for (int i = 0; i < SPECTROGRAM_WIDTH; i++) {
+        for (int j = 0; j < NUM_BANDS; j++) {
+            // Serial.print(spectrogram_data[j + i * NUM_BANDS], 2);
+            Serial.print(spectrogram_data[j + i * NUM_BANDS]);
+            if (j+1 < NUM_BANDS) Serial.print(',');
         }
         Serial.println();
     }

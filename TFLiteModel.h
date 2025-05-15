@@ -15,8 +15,7 @@ class TFLiteModel
         // ~TFLiteModel();
 
         void Init();
-        bool Inference(float * input_data, int input_size, float * output_data, int output_size);
-        bool Inference_Quantize(float * input_data, int input_size, float * output_data, int output_size);
+        bool Inference(uint8_t * input_data, int input_size, float * output_data, int output_size);
 
     private:
         void TFLiteModel_Init();
