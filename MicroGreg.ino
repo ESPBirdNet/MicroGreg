@@ -201,8 +201,8 @@ static void SpectrogramTask(void* arg)
             }
 
             // Perform FFT
-            dsps_bit_rev_fc32(fft_buffer, FFT_SIZE);
             dsps_fft2r_fc32_ae32(fft_buffer, FFT_SIZE);
+            dsps_bit_rev_fc32(fft_buffer, FFT_SIZE);
 
             // compute power spectrum
             for (int k = 0; k < FFT_SIZE / 2; k++) 
