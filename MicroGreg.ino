@@ -24,14 +24,20 @@ TFLiteModel tfliteModel;
 #define MIC_WS   5    // word select (LRCLK)
 #define MIC_SCK  6    // bit clock (BCLK)
 
+// I2C config to display spectrogram from pi pico
+#define I2C_SDA  3
+#define I2C_SCL  4
+#define SLAVE_ADDR 0x42
+
 //============================== Configuration ==============================
 #define I2S_NUM                     I2S_NUM_0
-#define SAMPLE_BITS                 I2S_BITS_PER_SAMPLE_16BIT
+#define SAMPLE_BITS                 I2S_BITS_PER_SAMPLE_32BIT
 #define SAMPLE_RATE_HZ              32000
 
 // DMA buffer count & length (1024 samples each)
 #define DMA_BUF_LEN                 1024                    // 16ms of audio
 #define DMA_BUF_COUNT               32 + 16                 // 1s of stored audio + next quarter of second + residual
+#define DMA_BUF_COUNT_INT32         2
 
 // FFT / spectrogram parameters
 #define WIN_BUFFERS            32                           // around 1 second of audio
@@ -52,6 +58,9 @@ TFLiteModel tfliteModel;
 static int16_t * audioBufs[DMA_BUF_COUNT];
 static volatile size_t bufIndex = 0;
 
+static int32_t pingPongBuf[DMA_BUF_COUNT_INT32][DMA_BUF_LEN];
+static volatile int currentBuf = 0;
+
 // I2S event queue
 static QueueHandle_t i2s_evt_queue  = nullptr;
 
@@ -60,8 +69,8 @@ static volatile int bufferCount = 0;
 
 // Hann window & FFT arrays
 static float * hann_window;
-static float * fft_buffer;
-static float * power_spectrum;
+static int16_t * fft_buffer;
+static int32_t * power_spectrum;
 static float   band_energy;
 // static float   band_energies[NUM_BANDS];
 
@@ -89,9 +98,9 @@ static i2s_config_t i2s_cfg =
     .sample_rate          = SAMPLE_RATE_HZ,
     .bits_per_sample      = SAMPLE_BITS,
     .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S,
+    .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
     .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count        = DMA_BUF_COUNT,
+    .dma_buf_count        = DMA_BUF_COUNT_INT32,
     .dma_buf_len          = DMA_BUF_LEN,
     .use_apll             = true,
     .tx_desc_auto_clear   = false,
@@ -118,19 +127,41 @@ static void i2s_event_task(void* arg)
             if (evt.type == I2S_EVENT_RX_DONE)
             {
                 // read one full DMA buffer
-                i2s_read( I2S_NUM, audioBufs[bufIndex], DMA_BUF_LEN * sizeof(int16_t), &bytesRead, 0 );
+                i2s_read( I2S_NUM, pingPongBuf[currentBuf], DMA_BUF_LEN * sizeof(int32_t), &bytesRead, 0 );
 
                 // trigger spectrogram every HOP_BUFFERS
-                if (SpectrogramTaskHandle && ++bufferCount >= HOP_BUFFERS) 
-                {
-                    xTaskNotifyGive(SpectrogramTaskHandle);
-                    bufferCount = 0;
-                }
+                // if (SpectrogramTaskHandle && ++bufferCount >= HOP_BUFFERS) 
+                // {
+                //     xTaskNotifyGive(SpectrogramTaskHandle);
+                //     bufferCount = 0;
+                // }
 
-                bufIndex = (bufIndex + 1) % DMA_BUF_COUNT;
+                // bufIndex = (bufIndex + 1) % DMA_BUF_COUNT;
+
+                BufferPreprocess(pingPongBuf[currentBuf]);
+                currentBuf ^= 1;
             }
         }
     }
+}
+
+void BufferPreprocess(int32_t* buf)
+{
+    // Convert BE→LE & take top 16 bits of each 24-bit sample
+    for (size_t i = 0; i < DMA_BUF_LEN; i++) 
+    {
+        // uint32_t w = __builtin_bswap32(buf[i]);
+        // audioBufs[bufIndex][i] = (int16_t)(w >> 16);
+        audioBufs[bufIndex][i] = (int16_t)(buf[i] >> 8);
+    }
+
+    // trigger spectrogram every HOP_BUFFERS
+    if (SpectrogramTaskHandle && ++bufferCount >= HOP_BUFFERS) 
+    {
+        xTaskNotifyGive(SpectrogramTaskHandle);
+        bufferCount = 0;
+    }
+    bufIndex = (bufIndex + 1) % DMA_BUF_COUNT;
 }
 
 /* 
@@ -146,8 +177,8 @@ static void SpectrogramTask(void* arg)
 {
     // Initialize DSP components
     hann_window = (float*)heap_caps_malloc(FFT_SIZE * sizeof(float), MALLOC_CAP_32BIT | MALLOC_CAP_8BIT);
-    fft_buffer = (float*)heap_caps_malloc(FFT_SIZE * 2 * sizeof(float), MALLOC_CAP_32BIT | MALLOC_CAP_8BIT);
-    power_spectrum = (float*)heap_caps_malloc((FFT_SIZE / 2) * sizeof(float), MALLOC_CAP_8BIT);
+    fft_buffer = (int16_t*)heap_caps_malloc(FFT_SIZE * 2 * sizeof(int16_t), MALLOC_CAP_32BIT | MALLOC_CAP_8BIT);
+    power_spectrum = (int32_t*)heap_caps_malloc(FFT_SIZE * sizeof(int32_t), MALLOC_CAP_8BIT);
 
     // Check for correct initialization
     assert(hann_window != nullptr);
@@ -158,7 +189,7 @@ static void SpectrogramTask(void* arg)
     dsps_wind_hann_f32(hann_window, FFT_SIZE);
 
     // Initialize FFT
-    esp_err_t ret = dsps_fft2r_init_fc32(NULL, FFT_SIZE);
+    esp_err_t ret = dsps_fft2r_init_sc16(NULL, FFT_SIZE);
     if (ret != ESP_OK) 
     {
         Serial.printf("FFT init failed: %d\n", ret);
@@ -186,30 +217,32 @@ static void SpectrogramTask(void* arg)
         unsigned long time = micros();
         
         // Copy value to avoid concurrent read/write
-        size_t bufIndex_copy = bufIndex;
+        size_t bufIndex_copy = bufIndex - 1;
 
         /*** START OF SPECTROGRAM COMPUTATION ***/
         for (int frame_index = 0; frame_index < SPECTROGRAM_WIDTH; frame_index++) 
         {
             // Compute the buffer index for this frame
-            int idx = (bufIndex_copy - WIN_BUFFERS + frame_index) % DMA_BUF_COUNT;
+            int raw = bufIndex_copy - WIN_BUFFERS + frame_index;
+            int idx = (raw % DMA_BUF_COUNT + DMA_BUF_COUNT) % DMA_BUF_COUNT;
 
-            for (int i = 0; i < DMA_BUF_LEN; i++) 
+            for (int i = 0; i < FFT_SIZE; i++) 
             {
-                fft_buffer[2 * i + 0] = audioBufs[idx][i] * hann_window[i];
-                fft_buffer[2 * i + 1] = 0.0f;
+                fft_buffer[2 * i + 0] = audioBufs[idx][i];// * hann_window[i];
+                fft_buffer[2 * i + 1] = 0;
             }
 
             // Perform FFT
-            dsps_fft2r_fc32_ae32(fft_buffer, FFT_SIZE);
-            dsps_bit_rev_fc32(fft_buffer, FFT_SIZE);
-
-            // compute power spectrum
-            for (int k = 0; k < FFT_SIZE / 2; k++) 
+            dsps_fft2r_sc16_aes3(fft_buffer, FFT_SIZE);
+            dsps_bit_rev_sc16_ansi(fft_buffer, FFT_SIZE);
+            // dsps_cplx2reC_sc16(fft_buffer, FFT_SIZE);
+            
+            // Compute power spectrum for real FFT output
+            for (int k = 0; k <= FFT_SIZE / 2; k++) 
             {
-                float re = fft_buffer[2 * k];
-                float im = fft_buffer[2 * k + 1];
-                power_spectrum[k] = re * re + im * im;
+                float re = fft_buffer[k * 2 + 0];     // Re[k]
+                float im = fft_buffer[k * 2 + 1];     // Im[k]
+                power_spectrum[k] = re*re + im*im;
             }
 
             // sum into NUM_BANDS equal-width bands and log10 scale
@@ -217,15 +250,13 @@ static void SpectrogramTask(void* arg)
             for (int b = 0; b < NUM_BANDS; b++) 
             {
                 float sum = 0.0f;
-                int start = b * binsPerBand;
-                int end = start + binsPerBand;
-                for (int k = start; k < end; k++) 
+                for (int k = b * binsPerBand; k < (b+1) * binsPerBand; k++) 
                 {
                     sum += power_spectrum[k];
                 }
+                band_energy = 10.0f * log10f(sum + 1e-12f);
 
                 // Clip and scale to cover all 0 to 255 uint8 values
-                band_energy = 10.0f * log10f(sum + 1e-12f);
                 band_energy = constrain(band_energy, SPECTRUM_FLOOR, SPECTRUM_CEIL);
                 band_energy = (band_energy - SPECTRUM_FLOOR) * SPECTRUM_SCALE;
                 band_energy = constrain(band_energy, 0.f, 255.f);
@@ -237,7 +268,9 @@ static void SpectrogramTask(void* arg)
         Serial.println("[Spectrogram] Performance ms:" + String((micros() - time) / 1000.f));
 
         // DisplaySpectrogram_Serial();
-        // DisplaySpectrogram_OLED(); 
+        // DisplaySpectrogram_OLED_128bands(); 
+
+        Display_ST7789V();
         
         xTaskNotifyGive(InferenceTaskHandle);
 
@@ -247,7 +280,7 @@ static void SpectrogramTask(void* arg)
     free(hann_window);
     free(fft_buffer);
     free(power_spectrum);
-    dsps_fft2r_deinit_fc32();
+    dsps_fft2r_deinit_sc16();
     vTaskDelete(NULL); // Delete the task itself.
 }
 
@@ -276,7 +309,7 @@ static void InferenceTask(void* arg)
             // Display the results
             Serial.println("[Inference] Performance ms:" + String((micros() - time) / 1000.f));
             DisplayScores_OLED(scores, 5, (micros() - time) / 1000.f);
-            //DisplayScores_Serial(scores, 5);
+            DisplayScores_Serial(scores, 5);
         }
     }
 }
@@ -310,7 +343,9 @@ void monitorTask(void* pv) {
 //==================== Setup & loop ====================
 void setup()
 {
-    Serial.begin(115200);
+    Wire.begin(I2C_SDA, I2C_SCL); // SDA, SCL for pi pico communication
+
+    Serial.begin(921600);
     delay(100);
 
     VextON();       // Power OLED
@@ -343,7 +378,7 @@ void setup()
     }
 
     // start monitoring task
-    xTaskCreate( monitorTask, "TaskMonitor", 2048, nullptr, tskIDLE_PRIORITY + 1, nullptr );
+    // xTaskCreate( monitorTask, "TaskMonitor", 2048, nullptr, tskIDLE_PRIORITY + 1, nullptr );
 
     // install I2S driver with event queue
     ESP_ERROR_CHECK( i2s_driver_install( I2S_NUM, &i2s_cfg, DMA_BUF_COUNT, &i2s_evt_queue) );
@@ -418,7 +453,7 @@ void DisplaySpectrogram_OLED()
     display.display();
 }
 
-void DisplaySpectrogram_OLED_64bands() 
+void DisplaySpectrogram_OLED_128bands() 
 {
     display.clear();
     const int W      = display.getWidth();    // 128
@@ -476,6 +511,40 @@ void DisplayScores_OLED(const float* scores, int numScores, float ms)
     display.drawString(x, y, String(ms));
 
     display.display();
+}
+
+// Stream a big buffer in CHUNK_SIZE slices
+void SendSpectrogram() 
+{
+    const size_t CHUNK_SIZE = 128;
+    const size_t length = NUM_BANDS * SPECTROGRAM_WIDTH;
+    for (size_t offset = 0; offset < length; offset += CHUNK_SIZE) 
+    {
+        size_t this_len = min(CHUNK_SIZE, length - offset);
+        Wire.beginTransmission(SLAVE_ADDR);
+        Wire.write(spectrogram_data + offset, this_len);
+        Wire.endTransmission();
+        delay(1);  // give the Pico time to store it
+    }
+}
+
+void Display_ST7789V()
+{
+    Wire.beginTransmission(SLAVE_ADDR);
+    uint32_t cmd = 0x00FEED00;
+    uint8_t buf[5] = {
+        uint8_t(cmd>>24), 
+        uint8_t(cmd>>16),
+        uint8_t(cmd>> 8), 
+        uint8_t(cmd    ),
+        0
+    };
+    
+    buf[4] = buf[0]+buf[1]+buf[2]+buf[3];
+    Wire.write(buf, 5);
+    Wire.endTransmission();
+    
+    SendSpectrogram();
 }
 
 /*
